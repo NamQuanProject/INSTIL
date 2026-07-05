@@ -1,0 +1,11 @@
+# Instil reference implementation -- minimal, decoupled from SAPT's frozen env.
+# A recent PyTorch + Transformers is enough; pin to taste.
+
+torch>=2.1
+transformers>=4.30
+sentencepiece>=0.1.99      # T5 tokenizer
+numpy>=1.22
+# optional, only for the Law-experiment scatter plot:
+matplotlib>=3.5
+# optional, only if you run the tests:
+# pytest>=7.0
