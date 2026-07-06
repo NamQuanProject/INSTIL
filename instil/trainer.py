@@ -14,6 +14,7 @@ each ``loss.backward()``.
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Iterable, List, Optional, Tuple
 
 import torch
@@ -32,10 +33,13 @@ class ContinualTrainer:
                  optimizer_factory: Optional[OptimizerFactory] = None,
                  epochs: int = 1, grad_clip: Optional[float] = 1.0,
                  lr: float = 3e-4, device: Optional[str] = None,
-                 forward_fn=None, log_every: int = 0):
+                 forward_fn=None, log_every: int = 0, min_steps: int = 0):
         self.instil = instil
         self.loss_fn = loss_fn
         self.epochs = epochs
+        # Floor on optimisation steps per task: small tasks (few hundred
+        # examples) otherwise get only ~80-100 updates and stay undertrained.
+        self.min_steps = min_steps
         self.grad_clip = grad_clip
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.forward_fn = forward_fn
@@ -56,10 +60,16 @@ class ContinualTrainer:
                 steps_per_epoch = len(train_loader)
             except TypeError:
                 steps_per_epoch = None
-            total = self.epochs * steps_per_epoch if steps_per_epoch else None
+            # Raise the epoch count so every task gets at least ``min_steps``
+            # updates -- small tasks otherwise converge nowhere near their loss.
+            n_epochs = self.epochs
+            if self.min_steps and steps_per_epoch:
+                n_epochs = max(self.epochs,
+                               math.ceil(self.min_steps / steps_per_epoch))
+            total = n_epochs * steps_per_epoch if steps_per_epoch else None
             bar = tqdm_bar(total=total, desc=desc, leave=False)
             step, running = 0, 0.0
-            for epoch in range(self.epochs):
+            for epoch in range(n_epochs):
                 for batch in train_loader:
                     optimizer.zero_grad(set_to_none=True)
                     loss = self.loss_fn(self.instil.model, batch)
@@ -77,7 +87,7 @@ class ContinualTrainer:
                     bar.set_postfix(epoch=epoch + 1, loss=f"{lv:.4f}")
                     if self.log_every and step % self.log_every == 0:
                         logger.info(f"  [{desc}] step {step:5d}/{total or '?'} "
-                                    f"epoch {epoch + 1}/{self.epochs} "
+                                    f"epoch {epoch + 1}/{n_epochs} "
                                     f"loss {lv:.4f} (avg {running / step:.4f})")
             bar.close()
             if step:

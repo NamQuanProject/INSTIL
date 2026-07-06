@@ -237,6 +237,18 @@ this build (the gate is enforced structurally by the frozen basis `A`).
 * **Subspace** — `energy_threshold` (default 0.95) and `subspace_rank_cap` bound
   each task's stored basis; `max_activation_samples` (~2k) caps the covariance
   collection budget. Bases are tiny (`in × R`) and kept on CPU.
+* **Per-task fitting** — accuracy on a task is capped by how well its adapter
+  fits, independent of the CL machinery. Knobs that matter (all safe in `bank`
+  mode, where each task has its own adapter):
+  * `--min_steps` (default 300) — floor on optimisation steps per task. Small
+    tasks (100–160 examples) otherwise get only ~80–100 updates and stay
+    undertrained; this raises the epoch count just for them.
+  * `--num_beams` (default 4) — beam search at eval; lifts ROUGE on generative
+    tasks vs. greedy decoding.
+  * `--max_target_length` (default 128) — summarization references often exceed
+    50 tokens; a small cap truncates both targets and generations.
+  * `--lora_r` / `--target_modules` — raise capacity for hard generative tasks
+    (e.g. `--lora_r 16`); in `bank` mode this cannot increase forgetting.
 * **Storage** — merge: only `{U_j}` + `{p_j}` (MBs). bank: additionally the
   per-task LoRA deltas.
 * **Progress & logging** — training/eval show live `tqdm` bars (per-task loss,

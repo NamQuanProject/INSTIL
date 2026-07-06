@@ -51,11 +51,16 @@ def parse_args():
     p.add_argument("--lora_alpha", type=int, default=16)
     p.add_argument("--target_modules", default="q,v")
     p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--min_steps", type=int, default=300,
+                   help="floor on optimisation steps per task (fixes small/undertrained tasks)")
+    p.add_argument("--num_beams", type=int, default=4,
+                   help="beam search width at eval (lifts ROUGE on generative tasks)")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--eval_batch_size", type=int, default=32)
     p.add_argument("--max_source_length", type=int, default=512)
-    p.add_argument("--max_target_length", type=int, default=50)
+    p.add_argument("--max_target_length", type=int, default=128,
+                   help="raise for summarization tasks whose references exceed 50 tokens")
     p.add_argument("--gate_slope_a", type=float, default=10.0)
     p.add_argument("--rho0", type=float, default=None,
                    help="fix the gate zero-crossing; omit to use 0.0 / Law fit")
@@ -70,14 +75,14 @@ def parse_args():
 
 
 @torch.no_grad()
-def generate(model, tokenizer, eval_loader, device, max_new_tokens, desc="eval"):
+def generate(model, tokenizer, eval_loader, device, max_new_tokens, num_beams=4, desc="eval"):
     model.eval()
     preds = []
     for batch in tqdm_iter(eval_loader, desc=desc, leave=False):
         gen = model.generate(
             input_ids=batch["input_ids"].to(device),
             attention_mask=batch["attention_mask"].to(device),
-            max_new_tokens=max_new_tokens, num_beams=1,
+            max_new_tokens=max_new_tokens, num_beams=num_beams,
         )
         preds.extend(tokenizer.batch_decode(gen, skip_special_tokens=True))
     return preds
@@ -89,10 +94,10 @@ def eval_task(instil, model, tokenizer, task, eval_loader, args, desc="eval"):
     if instil.cfg.mode == "bank":
         with instil.answer(task["instruction"]):
             preds = generate(model, tokenizer, eval_loader, args.device,
-                             args.max_target_length, desc=desc)
+                             args.max_target_length, args.num_beams, desc=desc)
     else:
         preds = generate(model, tokenizer, eval_loader, args.device,
-                         args.max_target_length, desc=desc)
+                         args.max_target_length, args.num_beams, desc=desc)
     return corpus_score(preds, references, args.metric)
 
 
@@ -133,7 +138,7 @@ def main():
 
     trainer = ContinualTrainer(instil, loss_fn, epochs=args.epochs, lr=args.lr,
                                device=args.device, forward_fn=forward_fn,
-                               log_every=10)
+                               log_every=10, min_steps=args.min_steps)
 
     # Cache task data + eval loaders as we go.
     tasks, eval_loaders = [], []
