@@ -35,6 +35,7 @@ from instil import (InstilConfig, inject_instil_lora, iter_instil_layers,
 from instil.law import (compute_task_weight_gradients, measure_gradient_alignment,
                         validate_law)
 from instil.data_superni import load_superni_task, make_loaders
+from instil.logging_utils import setup_file_logger, tqdm_iter
 
 
 def parse_args():
@@ -59,6 +60,9 @@ def main():
     from transformers import AutoTokenizer, T5ForConditionalGeneration
 
     os.makedirs(args.output_dir, exist_ok=True)
+    logger, logfile = setup_file_logger(
+        run_name="law_" + (os.path.basename(args.output_dir.rstrip("/")) or "run"),
+        log_dir="logs")
     task_order = args.task_order.split(",")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -72,8 +76,8 @@ def main():
 
     prototypes, task_grads, task_subspaces = [], [], []
 
-    for i, name in enumerate(task_order):
-        print(f"[law] task {i}: {name}")
+    for i, name in enumerate(tqdm_iter(task_order, desc="law tasks", leave=True)):
+        logger.info(f"[law] task {i}: {name}")
         task = load_superni_task(args.data_dir, name, args.benchmark)
         prototypes.append(encoder.encode_one(task["instruction"]).float())
         train_loader, _, _ = make_loaders(
@@ -119,8 +123,8 @@ def main():
     sims, aligns, pairs = measure_gradient_alignment(
         prototypes, task_grads, task_subspaces, layer_names)
     summary = validate_law(sims, aligns)
-    print("\n==== Instruction-Gradient Alignment Law ====")
-    print(json.dumps(summary, indent=2))
+    logger.info("==== Instruction-Gradient Alignment Law ====")
+    logger.info(json.dumps(summary, indent=2))
 
     with open(os.path.join(args.output_dir, "law_points.csv"), "w", newline="") as f:
         w = csv.writer(f)
@@ -145,9 +149,10 @@ def main():
         plt.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(args.output_dir, "law_scatter.png"), dpi=150)
-        print(f"[law] scatter saved to {args.output_dir}/law_scatter.png")
+        logger.info(f"[law] scatter saved to {args.output_dir}/law_scatter.png")
     except Exception as e:  # pragma: no cover
-        print(f"[law] (matplotlib unavailable, skipping plot: {e})")
+        logger.info(f"[law] (matplotlib unavailable, skipping plot: {e})")
+    logger.info(f"full log at {logfile}")
 
 
 if __name__ == "__main__":

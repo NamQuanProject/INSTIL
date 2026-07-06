@@ -4,3 +4,7 @@ temp/
 __pycache__
 SAPT/
 HESTIA/
+logs/
+logs_and_outputs/
+*.pt
+.venv/

@@ -5,6 +5,7 @@ torch>=2.1
 transformers>=4.30
 sentencepiece>=0.1.99      # T5 tokenizer
 numpy>=1.22
+tqdm>=4.64                 # training / eval progress bars
 # optional, only for the Law-experiment scatter plot:
 matplotlib>=3.5
 # optional, only if you run the tests:

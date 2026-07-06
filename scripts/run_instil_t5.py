@@ -36,6 +36,7 @@ from instil import (InstilConfig, Instil, inject_instil_lora,
 from instil.trainer import ContinualTrainer
 from instil.data_superni import load_superni_task, make_loaders
 from instil.textscore import corpus_score
+from instil.logging_utils import setup_file_logger, tqdm_iter
 
 
 def parse_args():
@@ -62,15 +63,17 @@ def parse_args():
     p.add_argument("--max_train", type=int, default=None)
     p.add_argument("--max_eval", type=int, default=200)
     p.add_argument("--output_dir", default="logs_and_outputs/instil_superni")
+    p.add_argument("--log_dir", default="logs")
+    p.add_argument("--run_name", default=None, help="log/run name (default: from output_dir)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
 
 @torch.no_grad()
-def generate(model, tokenizer, eval_loader, device, max_new_tokens):
+def generate(model, tokenizer, eval_loader, device, max_new_tokens, desc="eval"):
     model.eval()
     preds = []
-    for batch in eval_loader:
+    for batch in tqdm_iter(eval_loader, desc=desc, leave=False):
         gen = model.generate(
             input_ids=batch["input_ids"].to(device),
             attention_mask=batch["attention_mask"].to(device),
@@ -80,16 +83,16 @@ def generate(model, tokenizer, eval_loader, device, max_new_tokens):
     return preds
 
 
-def eval_task(instil, model, tokenizer, task, eval_loader, args):
+def eval_task(instil, model, tokenizer, task, eval_loader, args, desc="eval"):
     """Evaluate one seen task via Bank routing (or the shared adapter in merge)."""
     references = [e.target for e in eval_loader.dataset]
     if instil.cfg.mode == "bank":
         with instil.answer(task["instruction"]):
             preds = generate(model, tokenizer, eval_loader, args.device,
-                             args.max_target_length)
+                             args.max_target_length, desc=desc)
     else:
         preds = generate(model, tokenizer, eval_loader, args.device,
-                         args.max_target_length)
+                         args.max_target_length, desc=desc)
     return corpus_score(preds, references, args.metric)
 
 
@@ -98,6 +101,9 @@ def main():
     from transformers import AutoTokenizer, T5ForConditionalGeneration
 
     os.makedirs(args.output_dir, exist_ok=True)
+    run_name = args.run_name or (os.path.basename(args.output_dir.rstrip("/")) or "instil")
+    logger, logfile = setup_file_logger(run_name=run_name, log_dir=args.log_dir)
+    logger.info(f"run={run_name} | args: {vars(args)}")
     task_order = args.task_order.split(",")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -110,8 +116,8 @@ def main():
         mode=args.mode, gate_slope_a=args.gate_slope_a, rho0=args.rho0,
         warm_start=not args.no_warm_start,
     )
-    wrapped = inject_instil_lora(model, cfg, verbose=True)
-    print(f"[instil] wrapped {len(wrapped)} linear layers")
+    wrapped = inject_instil_lora(model, cfg, verbose=False)
+    logger.info(f"wrapped {len(wrapped)} linear layers ({cfg.target_modules})")
 
     encoder = MeanPooledBackboneEncoder(model, tokenizer,
                                         max_length=args.max_source_length,
@@ -133,8 +139,11 @@ def main():
     tasks, eval_loaders = [], []
     R = []  # lower-triangular result matrix
 
-    for i, name in enumerate(task_order):
-        print(f"\n===== Task {i}: {name} =====")
+    task_bar = tqdm_iter(range(len(task_order)), desc="tasks", total=len(task_order),
+                         leave=True)
+    for i in task_bar:
+        name = task_order[i]
+        logger.info(f"===== Task {i}/{len(task_order)-1}: {name} =====")
         task = load_superni_task(args.data_dir, name, args.benchmark)
         train_loader, eval_loader, _ = make_loaders(
             task, tokenizer, batch_size=args.batch_size,
@@ -146,27 +155,33 @@ def main():
         tasks.append(task)
         eval_loaders.append(eval_loader)
 
-        trainer.learn_task(task["instruction"], train_loader, collect_loader=train_loader)
+        trainer.learn_task(task["instruction"], train_loader,
+                           collect_loader=train_loader, desc=f"task{i}:{name[:18]}")
 
         # Evaluate all tasks seen so far -> row i of R.
         row = []
         for j in range(i + 1):
-            score = eval_task(instil, model, tokenizer, tasks[j], eval_loaders[j], args)
+            score = eval_task(instil, model, tokenizer, tasks[j], eval_loaders[j],
+                              args, desc=f"eval t{j}")
             row.append(score)
-            print(f"    R[{i}][{j}] ({task_order[j]}): {score:.2f}")
+            logger.info(f"    R[{i}][{j}] {task_order[j]:<45} {args.metric}={score:.2f}")
         row.extend([0.0] * (len(task_order) - i - 1))
         R.append(row)
+        seen = continual_metrics(R)
+        logger.info(f"    running metrics after task {i}: "
+                    f"OP={seen['OP']:.2f} BWT={seen['BWT']:.2f} "
+                    f"FWT={seen['FWT']:.2f} Fgt={seen['Forgetting']:.2f}")
 
     metrics = continual_metrics(R)
-    print("\n==== Instil continual-learning metrics ====")
-    print(json.dumps(metrics, indent=2))
+    logger.info("==== Instil continual-learning metrics ====")
+    logger.info(json.dumps(metrics, indent=2))
 
     with open(os.path.join(args.output_dir, "results.json"), "w") as f:
         json.dump({"task_order": task_order, "R": R, "metrics": metrics}, f, indent=2)
     instil.save(os.path.join(args.output_dir, "instil_state.pt"))
     with open(os.path.join(args.output_dir, "task_order.txt"), "w") as f:
         f.write(",".join(task_order))
-    print(f"[instil] saved to {args.output_dir}")
+    logger.info(f"saved outputs to {args.output_dir} | full log at {logfile}")
 
 
 if __name__ == "__main__":

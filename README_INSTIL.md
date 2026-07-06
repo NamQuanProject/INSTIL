@@ -239,6 +239,11 @@ this build (the gate is enforced structurally by the frozen basis `A`).
   collection budget. Bases are tiny (`in × R`) and kept on CPU.
 * **Storage** — merge: only `{U_j}` + `{p_j}` (MBs). bank: additionally the
   per-task LoRA deltas.
+* **Progress & logging** — training/eval show live `tqdm` bars (per-task loss,
+  collection pass, generation), and every run is logged to
+  `logs/<run_name>.log` (both stdout and file). `logs/` and `logs_and_outputs/`
+  are git-ignored. Control with `--log_dir` / `--run_name`; `tqdm` degrades to a
+  no-op if not installed, so nothing breaks without it.
 
 ### Computational efficiency (the expensive `torch.linalg.svd` is gone)
 

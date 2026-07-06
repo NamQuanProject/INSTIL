@@ -26,6 +26,7 @@ from .config import InstilConfig
 from .encoders import InstructionEncoder
 from .gate import InstructionGate
 from .lora import InstilLoRALinear, iter_instil_layers
+from .logging_utils import get_logger, tqdm_iter
 from .update import project_instil_gradients
 
 ForwardFn = Callable[[nn.Module, object], None]
@@ -129,9 +130,15 @@ class Instil:
         collect_batches: Iterable = (),
         forward_fn: Optional[ForwardFn] = None,
     ) -> torch.Tensor:
+        logger = get_logger()
         p_t = self.encoder.encode_one(instruction).float()
         task_id = self.num_tasks
         gamma = self.gamma_vector(p_t)
+        if task_id > 0:
+            gmax = float(gamma.max()) if gamma.numel() else 0.0
+            n_aligned = int((gamma >= self.cfg.gate_floor).sum())
+            logger.info(f"task {task_id}: gate admits {n_aligned}/{task_id} prior "
+                        f"tasks (max gamma={gmax:.3f}) | mode={self.cfg.mode}")
 
         # 1) Pre-pass: accumulate this task's input covariance (per layer).
         cov = self._collect_activations(collect_batches, forward_fn)
@@ -185,7 +192,7 @@ class Instil:
         was_training = self.model.training
         self.model.eval()
         with torch.no_grad():
-            for batch in collect_batches:
+            for batch in tqdm_iter(collect_batches, desc="collect", leave=False):
                 if forward_fn is not None:
                     forward_fn(self.model, batch)
                 else:

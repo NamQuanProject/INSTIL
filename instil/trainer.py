@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 
 from .instil import Instil
+from .logging_utils import get_logger, tqdm_bar
 
 
 OptimizerFactory = Callable[[Iterable[nn.Parameter]], torch.optim.Optimizer]
@@ -46,11 +47,19 @@ class ContinualTrainer:
     def _trainable_params(self):
         return [p for p in self.instil.model.parameters() if p.requires_grad]
 
-    def _make_train_step(self, train_loader) -> Callable[[], None]:
+    def _make_train_step(self, train_loader, desc: str = "train") -> Callable[[], None]:
+        logger = get_logger()
+
         def train_step():
             optimizer = self.optimizer_factory(self._trainable_params())
-            step = 0
-            for _ in range(self.epochs):
+            try:
+                steps_per_epoch = len(train_loader)
+            except TypeError:
+                steps_per_epoch = None
+            total = self.epochs * steps_per_epoch if steps_per_epoch else None
+            bar = tqdm_bar(total=total, desc=desc, leave=False)
+            step, running = 0, 0.0
+            for epoch in range(self.epochs):
                 for batch in train_loader:
                     optimizer.zero_grad(set_to_none=True)
                     loss = self.loss_fn(self.instil.model, batch)
@@ -62,21 +71,33 @@ class ContinualTrainer:
                             self._trainable_params(), self.grad_clip)
                     optimizer.step()
                     step += 1
+                    lv = float(loss)
+                    running += lv
+                    bar.update(1)
+                    bar.set_postfix(epoch=epoch + 1, loss=f"{lv:.4f}")
                     if self.log_every and step % self.log_every == 0:
-                        print(f"    step {step:5d}  loss {float(loss):.4f}")
+                        logger.info(f"  [{desc}] step {step:5d}/{total or '?'} "
+                                    f"epoch {epoch + 1}/{self.epochs} "
+                                    f"loss {lv:.4f} (avg {running / step:.4f})")
+            bar.close()
+            if step:
+                logger.info(f"  [{desc}] done: {step} steps, "
+                            f"final loss {running / step:.4f} (avg)")
         return train_step
 
-    def learn_task(self, instruction: str, train_loader, collect_loader=None):
+    def learn_task(self, instruction: str, train_loader, collect_loader=None,
+                   desc: str = "train"):
         collect = collect_loader if collect_loader is not None else train_loader
         return self.instil.learn_task(
             instruction=instruction,
-            train_step=self._make_train_step(train_loader),
+            train_step=self._make_train_step(train_loader, desc=desc),
             collect_batches=collect,
             forward_fn=self.forward_fn,
         )
 
     def run_stream(self, stream: Iterable[Tuple[str, object, object]]) -> List[torch.Tensor]:
         """Run a full stream of ``(instruction, train_loader, collect_loader)``."""
+        logger = get_logger()
         protos = []
         for i, item in enumerate(stream):
             if len(item) == 3:
@@ -84,6 +105,7 @@ class ContinualTrainer:
             else:
                 instruction, train_loader = item
                 collect_loader = None
-            print(f"[instil] === task {i}: {instruction[:60]!r} ===")
-            protos.append(self.learn_task(instruction, train_loader, collect_loader))
+            logger.info(f"=== task {i}: {instruction[:60]!r} ===")
+            protos.append(self.learn_task(instruction, train_loader, collect_loader,
+                                          desc=f"task{i}"))
         return protos
