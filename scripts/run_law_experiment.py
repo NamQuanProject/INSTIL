@@ -14,7 +14,7 @@ A PNG scatter is written too if matplotlib is available.
 Example
 -------
     python scripts/run_law_experiment.py \
-        --model_name_or_path t5-large --data_dir SAPT/CL_Benchmark \
+        --model_name_or_path t5-large --data_dir data \
         --task_order taskA,taskB,taskC,... --max_batches 4 --output_dir law_out
 """
 
@@ -40,7 +40,7 @@ from instil.data_superni import load_superni_task, make_loaders
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model_name_or_path", required=True)
-    p.add_argument("--data_dir", default="SAPT/CL_Benchmark")
+    p.add_argument("--data_dir", default="data")
     p.add_argument("--benchmark", default="SuperNI")
     p.add_argument("--task_order", required=True)
     p.add_argument("--target_modules", default="q,v")
@@ -99,10 +99,10 @@ def main():
                       labels=b["labels"])
         subs = {}
         for n, layer in iter_instil_layers(model):
-            acts = layer.stop_collecting()
+            C, cnt = layer.stop_collecting()
             m = layer.memory
-            if acts.shape[0] > 0:
-                m.add_task(acts, i)
+            if cnt > 0:
+                m.add_task_cov(C, cnt, i)
             subs[n] = m.basis_for(i)
         task_subspaces.append(subs)
 

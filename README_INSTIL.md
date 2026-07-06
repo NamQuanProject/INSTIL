@@ -12,7 +12,7 @@ Reference implementation of the proposal in [`ideas/instil.pdf`](ideas/instil.pd
 
 This package is built on the same stack as the bundled **SAPT** codebase
 (PyTorch + Transformers, LoRA on the attention `q, v` projections, the SuperNI
-CIT benchmark under `SAPT/CL_Benchmark`) and reuses SAPT's metric definitions so
+CIT benchmark under `data/`) and reuses SAPT's metric definitions so
 numbers are directly comparable.
 
 ---
@@ -31,10 +31,11 @@ instil/                     the library
   metrics.py                OP / Forgetting / BWT / FWT (matches score.py)      [§9]
   law.py                    Experiment 1 — validate the Instruction–Gradient Law[§4,§9]
   trainer.py                thin continual-training loop                        [§7]
-  data_superni.py           SuperNI / Long-Sequence loaders (CL_Benchmark)
+  data_superni.py           SuperNI / Long-Sequence loaders (data/)
   textscore.py              ROUGE-L / exact-match scorers (no external deps)
 
 scripts/
+  prepare_superni_data.py   (re)build data/ from natural-instructions
   run_instil_t5.py          FULL train + test pipeline on SuperNI with T5
   run_law_experiment.py     Experiment 1 driver (the "plot that decides the paper")
   demo_synthetic.py         CPU-only end-to-end demo & self-check (no downloads)
@@ -53,6 +54,32 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## 2b. Get the data
+
+The SuperNI CIT data lives under `data/SuperNI/<task>/{train,dev,test}.json`.
+It ships with the repo, so **if `data/` is already populated you can skip this
+section.** To (re)build it from scratch on a new machine, or to regenerate
+different split sizes, run the dependency-free preparer — each split file is just
+the authoritative Natural-Instructions task file with its `Instances` sliced:
+
+```bash
+# downloads the 15 standard SuperNI CIT tasks into data/SuperNI
+python scripts/prepare_superni_data.py
+```
+
+Offline / behind a proxy? Clone the source and point at it:
+
+```bash
+git clone --depth 1 https://github.com/allenai/natural-instructions
+python scripts/prepare_superni_data.py --source natural-instructions/tasks
+```
+
+Options: `--tasks a,b,c` (subset), `--train_size/--dev_size/--test_size`,
+`--output_dir` (default `data`), `--force` (rebuild), `--no_shuffle`. Existing
+files are kept unless `--force`. Splits are disjoint and reproducible (seeded);
+they are valid and comparable across runs even if not byte-identical to the
+authors' original indices.
+
 ## 3. Smoke test (no model downloads, CPU)
 
 Verifies the core mechanics end-to-end on synthetic tasks — exact
@@ -70,12 +97,13 @@ python scripts/demo_synthetic.py
 instruction-gated update, and **after every task evaluates all seen tasks** to
 fill the lower-triangular result matrix `R`, from which OP / Forgetting / BWT /
 FWT are computed (§9). Everything (training, evaluation, metrics, checkpoint)
-happens in one process.
+happens in one process. (Run `scripts/prepare_superni_data.py` first if
+`data/` is empty — see §2b.)
 
 ```bash
 python scripts/run_instil_t5.py \
   --model_name_or_path t5-large \
-  --data_dir SAPT/CL_Benchmark --benchmark SuperNI \
+  --data_dir data --benchmark SuperNI \
   --task_order task1572_samsum_summary,task363_sst2_polarity_classification,task1290_xsum_summarization,task181_outcome_extraction,task002_quoref_answer_generation,task1510_evalution_relation_extraction,task639_multi_woz_user_utterance_generation,task1729_personachat_generate_next,task073_commonsenseqa_answer_generation,task1590_diplomacy_text_generation,task748_glucose_reverse_cause_event_detection,task511_reddit_tifu_long_text_summarization,task591_sciq_answer_generation,task1687_sentiment140_classification,task875_emotion_classification \
   --mode bank --lora_r 8 --lora_alpha 16 --target_modules q,v \
   --epochs 5 --lr 3e-4 --batch_size 8 \
@@ -87,7 +115,7 @@ python scripts/run_instil_t5.py \
 ```bash
 python scripts/run_instil_t5.py \
   --model_name_or_path t5-small \
-  --data_dir SAPT/CL_Benchmark \
+  --data_dir data \
   --task_order task363_sst2_polarity_classification,task1687_sentiment140_classification,task875_emotion_classification \
   --mode bank --epochs 1 --max_train 200 --max_eval 50 --device cpu \
   --output_dir logs_and_outputs/instil_smoke
@@ -128,7 +156,7 @@ accuracy, and the fitted zero-crossing `rho0` (which the gate then consumes):
 ```bash
 python scripts/run_law_experiment.py \
   --model_name_or_path t5-large \
-  --data_dir SAPT/CL_Benchmark \
+  --data_dir data \
   --task_order <same comma-separated order as above> \
   --max_batches 4 --output_dir law_out
 ```
@@ -148,7 +176,7 @@ then pass the fitted value as `--rho0` to `run_instil_t5.py`.
 | Thm. 2 FWT warm-start | `instil.py` `_warm_start` | init `B` from nearest prior adapter via least squares |
 | Prop. 2 routing | `instil.py` `routing_weights`, `answer` | frozen nearest-instruction lookup — zero trainable routing params |
 | §5.4 composition | `lora.py` bank + `answer` | `dW* = Σ_t w_t·dW_t` for blended instructions |
-| §5.1 bookkeeping | `subspace.py` `add_task` | top-`r` SVD of input activations, energy ≥ 0.95, orthogonalised |
+| §5.1 bookkeeping | `subspace.py` `add_task_cov` | streaming covariance `XᵀX`, top-`r` eigenvectors via `lobpcg` (no full SVD), energy ≥ 0.95, orthogonalised |
 | §9 metrics | `metrics.py` | same formulas as SAPT `score.py` |
 
 ## 7. Modes (`--mode`)
@@ -185,7 +213,7 @@ this build (the gate is enforced structurally by the frozen basis `A`).
 
 ## 9. Relationship to SAPT
 
-* **Data / metrics**: identical — `SAPT/CL_Benchmark`, RougeL/EM, and the
+* **Data / metrics**: same as SAPT — SuperNI tasks under `data/`, RougeL/EM, and the
   BWT/FWT/Forgetting definitions in `SAPT/score.py`.
 * **Adapter**: same LoRA parameterisation (`A: r×in`, `B: out×r`, `q,v`).
 * **Difference**: SAPT is *learned selection* (a trainable shared-attention
@@ -207,10 +235,34 @@ this build (the gate is enforced structurally by the frozen basis `A`).
   Experiment 1 and pass it in. `gamma < gate_floor` is clamped to exactly `0`
   so the non-forgetting guarantee is numerically exact.
 * **Subspace** — `energy_threshold` (default 0.95) and `subspace_rank_cap` bound
-  each task's stored basis; `max_activation_samples` (~2k) is the GPM collection
-  budget. Bases are tiny (`in × R`) and kept on CPU.
+  each task's stored basis; `max_activation_samples` (~2k) caps the covariance
+  collection budget. Bases are tiny (`in × R`) and kept on CPU.
 * **Storage** — merge: only `{U_j}` + `{p_j}` (MBs). bank: additionally the
   per-task LoRA deltas.
+
+### Computational efficiency (the expensive `torch.linalg.svd` is gone)
+
+The GPM bookkeeping used to run a full `torch.linalg.svd` on the whole
+`N × in` activation matrix of every tracked layer every task — the dominant
+cost (LAPACK, largely CPU-bound, `O(N·in²)`), plus `O(N·in)` memory to store the
+activations. Following HESTIA's online-statistics idea
+(`HESTIA/lib/signatures.py`: `OnlineDiagonalGMM` streams Welford means/vars
+instead of hoarding features), Instil now:
+
+1. **Streams a fixed-size covariance** `C = XᵀX` (`in × in`) during the
+   collection pass (`InstilLoRALinear._maybe_capture`) — never materialising the
+   `N × in` matrix. Memory drops from `O(N·in)` to `O(in²)`.
+2. **Extracts only the top-`r` eigenvectors** of the small symmetric `C` with
+   **`torch.lobpcg`** (`O(in²·r)`, `eigh` fallback for tiny/degenerate cases),
+   instead of a full SVD. Eigenvectors of `XᵀX` are exactly the right singular
+   vectors of `X`, so the subspace is identical — only cheaper. `trace(C)` gives
+   the total energy for the 0.95 cutoff, so no full spectrum is needed.
+
+Net effect: the per-task, per-layer decomposition goes from a full SVD over
+thousands of rows to a top-`r` eigensolve on a single `in × in` matrix, with a
+bounded memory footprint — the accuracy/subspace is unchanged. (The raw-activation
+`SubspaceMemory.add_task` / `free_directions` wrappers are kept for compatibility;
+they just build `XᵀX` and call the covariance path.)
 
 ## 11. Troubleshooting
 

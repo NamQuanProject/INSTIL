@@ -109,41 +109,51 @@ class SubspaceMemory:
         GU = G @ U                       # (*, R)
         return G - (GU * shrink) @ U.t()
 
-    # ------------------------------------------------- directions (no store)
+    # ---------------------------------------- efficient top-r eigendecomposition
     @torch.no_grad()
-    def _top_directions(self, activations: torch.Tensor, rank: int) -> torch.Tensor:
-        """Top right-singular vectors of ``activations`` (shape ``in x k``)."""
-        X = activations.to(self.dtype).to(self.device)
-        try:
-            _, S, Vh = torch.linalg.svd(X, full_matrices=False)
-        except Exception:  # pragma: no cover
-            _, S, Vh = torch.svd(X)
-            Vh = Vh.t()
-        V = Vh.t()
-        energy = S ** 2
-        total = energy.sum().clamp(min=1e-12)
-        cumfrac = torch.cumsum(energy, dim=0) / total
-        r = int(torch.searchsorted(cumfrac, torch.tensor(self.energy_threshold)).item()) + 1
-        r = max(1, min(r, rank, V.shape[1]))
-        return V[:, :r]
+    def _top_eig(self, C: torch.Tensor, k: int):
+        """Top-``k`` eigenpairs of a symmetric PSD matrix ``C`` (in x in).
 
-    @torch.no_grad()
-    def free_directions(self, activations: torch.Tensor, rank: int) -> torch.Tensor:
-        """Orthonormal top directions of the activations *projected to free space*.
+        Uses LOBPCG -- O(in^2 * k) for the k leading directions -- instead of a
+        full SVD/eigh, following the streaming, low-order-statistics philosophy
+        of HESTIA's OnlineDiagonalGMM.  Falls back to a dense ``eigh`` for small
+        matrices or if LOBPCG fails to converge.
 
-        These are the null-space (safe) rows of the frozen adapter basis ``A``
-        for a new task: the directions the task cares about, with everything
-        already occupied by prior tasks removed (so they are orthogonal to
-        ``span(U_<t)``).  Shape ``in x r_free``.
+        Returns ``(eigvals desc (k,), eigvecs (in, k))`` with eigvals clamped >=0.
         """
-        V = self._top_directions(activations, rank)
-        if self.rank > 0:
-            V = V - self.U @ (self.U.t() @ V)   # remove prior-occupied component
-        Q, _ = torch.linalg.qr(V)
-        # keep only well-conditioned, genuinely-free columns
+        C = C.to(self.dtype).to(self.device)
+        d = C.shape[0]
+        k = max(1, min(k, d))
+        # Tiny ridge keeps the matrix strictly PD for LOBPCG stability.
+        jitter = 1e-6 * (C.diagonal().mean().abs() + 1e-12)
+        use_dense = (d <= 64) or (k >= d - 1)
+        if not use_dense:
+            try:
+                Cj = C + jitter * torch.eye(d, dtype=self.dtype, device=self.device)
+                evals, evecs = torch.lobpcg(Cj, k=k, largest=True)
+                return evals.clamp(min=0.0), evecs
+            except Exception:  # pragma: no cover - fall back to dense
+                use_dense = True
+        evals, evecs = torch.linalg.eigh(C)          # ascending
+        evals = evals.flip(0)[:k].clamp(min=0.0)
+        evecs = evecs.flip(1)[:, :k]
+        return evals, evecs
+
+    def _rank_for_energy(self, evals: torch.Tensor, total_energy: torch.Tensor,
+                         rank: int) -> int:
+        """Smallest #directions whose captured energy reaches the threshold."""
+        total = total_energy.clamp(min=1e-12)
+        cumfrac = torch.cumsum(evals, dim=0) / total
+        r = int(torch.searchsorted(cumfrac, torch.tensor(
+            self.energy_threshold, dtype=cumfrac.dtype, device=cumfrac.device)).item()) + 1
+        return max(1, min(r, rank, evals.numel()))
+
+    def _orthonormalize_against_prior(self, V: torch.Tensor) -> torch.Tensor:
+        """Modified Gram-Schmidt of ``V``'s columns against ``self.U`` and each
+        other; drops numerically-zero (already-covered) columns."""
         keep = []
-        for c in range(Q.shape[1]):
-            col = Q[:, c]
+        for c in range(V.shape[1]):
+            col = V[:, c]
             if self.rank > 0:
                 col = col - self.U @ (self.U.t() @ col)
             if keep:
@@ -156,71 +166,67 @@ class SubspaceMemory:
             return torch.zeros(self.in_features, 0, dtype=self.dtype, device=self.device)
         return torch.stack(keep, dim=1)
 
-    # ---------------------------------------------------------- basis growth
+    # ---------------------------------------- covariance-based primary methods
     @torch.no_grad()
-    def add_task(self, activations: torch.Tensor, task_id: int) -> int:
-        """Grow the basis with directions occupied by ``task_id``.
+    def free_directions_cov(self, C: torch.Tensor, rank: int) -> torch.Tensor:
+        """Free-space (null) directions from a streaming covariance ``C=X^T X``.
 
-        Parameters
-        ----------
-        activations : (N, in_features) matrix of collected layer inputs.
-        task_id : id of the task these activations belong to.
-
-        Returns the number of new orthonormal columns appended (``r_t``).
-
-        Procedure (GPM):
-          1. SVD the (mean-removed) activation matrix.
-          2. Keep the smallest set of leading directions whose captured energy
-             reaches ``energy_threshold`` (capped at ``rank_cap``).
-          3. Remove the component already spanned by the existing basis,
-             re-orthonormalise (QR), and append.
+        The top directions of the task's inputs, with everything already
+        occupied by prior tasks removed (orthogonal to ``span(U_<t)``).  These
+        are the safe rows of the frozen adapter basis ``A`` (shape ``in x r``).
         """
-        X = activations.to(self.dtype).to(self.device)
-        if X.dim() != 2 or X.shape[1] != self.in_features:
-            raise ValueError(
-                f"expected (N, {self.in_features}) activations, got {tuple(X.shape)}"
-            )
-        # Right singular vectors of X == eigenvectors of the input covariance.
-        # X = U S V^T ;  the V columns (in-space) are the directions we store.
-        try:
-            _, S, Vh = torch.linalg.svd(X, full_matrices=False)
-        except Exception:  # pragma: no cover - numerical fallback
-            _, S, Vh = torch.svd(X)
-            Vh = Vh.t()
-        V = Vh.t()                      # (in_features, k)
-        energy = (S ** 2)
-        total = energy.sum().clamp(min=1e-12)
-        cumfrac = torch.cumsum(energy, dim=0) / total
-        r = int(torch.searchsorted(cumfrac, torch.tensor(self.energy_threshold)).item()) + 1
-        r = max(1, min(r, self.rank_cap, V.shape[1]))
-        candidate = V[:, :r]            # (in_features, r)
+        C = C.to(self.dtype).to(self.device)
+        if C.abs().sum() == 0:
+            return torch.zeros(self.in_features, 0, dtype=self.dtype, device=self.device)
+        _, V = self._top_eig(C, rank)
+        return self._orthonormalize_against_prior(V)
 
-        # Orthogonalise against the existing basis, then re-orthonormalise.
-        if self.rank > 0:
-            candidate = candidate - self.U @ (self.U.t() @ candidate)
-        # QR gives an orthonormal basis of the (residual) column space.
-        Q, _ = torch.linalg.qr(candidate)
-        # Drop numerically-zero columns (already covered by prior tasks).
-        keep = []
-        for c in range(Q.shape[1]):
-            col = Q[:, c]
-            if self.rank > 0:
-                col = col - self.U @ (self.U.t() @ col)
-            if len(keep) > 0:
-                Qk = torch.stack(keep, dim=1)
-                col = col - Qk @ (Qk.t() @ col)
-            n = col.norm()
-            if n > 1e-6:
-                keep.append(col / n)
-        if not keep:
-            # Fully covered already: register an empty block for bookkeeping.
+    @torch.no_grad()
+    def add_task_cov(self, C: torch.Tensor, count: int, task_id: int) -> int:
+        """Grow the occupied basis from a streaming covariance ``C = X^T X``.
+
+        Energy is read directly from the eigenvalues and ``trace(C)`` (== total
+        energy), so no full spectrum is needed.  Returns #new columns appended.
+        """
+        C = C.to(self.dtype).to(self.device)
+        if C.shape != (self.in_features, self.in_features):
+            raise ValueError(
+                f"expected ({self.in_features},{self.in_features}) covariance, "
+                f"got {tuple(C.shape)}")
+        if count <= 0 or C.abs().sum() == 0:
+            # Empty/degenerate task: register an empty block for bookkeeping.
             self.blocks.append(_TaskBlock(task_id, self.rank, self.rank))
             return 0
-        newcols = torch.stack(keep, dim=1)
+        evals, V = self._top_eig(C, self.rank_cap)
+        r = self._rank_for_energy(evals, C.diagonal().sum(), self.rank_cap)
+        newcols = self._orthonormalize_against_prior(V[:, :r])
+        if newcols.shape[1] == 0:
+            self.blocks.append(_TaskBlock(task_id, self.rank, self.rank))
+            return 0
         start = self.rank
         self.U = torch.cat([self.U, newcols], dim=1)
         self.blocks.append(_TaskBlock(task_id, start, self.U.shape[1]))
         return newcols.shape[1]
+
+    # ----------------------------------- raw-activation wrappers (compatibility)
+    @staticmethod
+    def covariance(activations: torch.Tensor) -> torch.Tensor:
+        """``X^T X`` for an ``(N, in)`` activation matrix (the only reduction kept)."""
+        X = activations.float()
+        return X.t() @ X
+
+    @torch.no_grad()
+    def free_directions(self, activations: torch.Tensor, rank: int) -> torch.Tensor:
+        return self.free_directions_cov(self.covariance(activations), rank)
+
+    @torch.no_grad()
+    def add_task(self, activations: torch.Tensor, task_id: int) -> int:
+        """Grow the basis from a raw ``(N, in)`` activation matrix (builds ``X^T X``)."""
+        if activations.dim() != 2 or activations.shape[1] != self.in_features:
+            raise ValueError(
+                f"expected (N, {self.in_features}) activations, got {tuple(activations.shape)}")
+        return self.add_task_cov(self.covariance(activations),
+                                 activations.shape[0], task_id)
 
     # ----------------------------------------------------------- persistence
     def state_dict(self) -> dict:

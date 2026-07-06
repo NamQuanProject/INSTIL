@@ -65,13 +65,17 @@ class Instil:
                                   torch.as_tensor(alignments))
 
     # ---------------------------------------------------- basis construction
-    def _build_basis(self, layer: InstilLoRALinear, acts: torch.Tensor,
+    def _build_basis(self, layer: InstilLoRALinear, cov: torch.Tensor,
                      gamma: torch.Tensor) -> torch.Tensor:
-        """Assemble the frozen adapter basis ``A`` (rows x in) for a task."""
+        """Assemble the frozen adapter basis ``A`` (rows x in) for a task.
+
+        ``cov`` is the streaming input covariance ``X^T X`` collected in the
+        pre-pass; free directions come from its top eigenvectors (no SVD).
+        """
         mem = layer.memory
         cols: List[torch.Tensor] = []
         # Null-space (safe) directions the task cares about, orthogonal to U_<t.
-        F = mem.free_directions(acts, rank=self.cfg.lora_r)
+        F = mem.free_directions_cov(cov, rank=self.cfg.lora_r)
         if F.shape[1] > 0:
             cols.append(F)
         # Gated occupied directions: block j admitted with weight gamma_j.
@@ -129,12 +133,13 @@ class Instil:
         task_id = self.num_tasks
         gamma = self.gamma_vector(p_t)
 
-        # 1) Pre-pass: collect this task's input activations (per layer).
-        acts = self._collect_activations(collect_batches, forward_fn)
+        # 1) Pre-pass: accumulate this task's input covariance (per layer).
+        cov = self._collect_activations(collect_batches, forward_fn)
 
         # 2) Build & install the frozen gated basis A; reset B to 0.
         for layer in self.layers:
-            A = self._build_basis(layer, acts[layer.name], gamma)
+            C, _ = cov[layer.name]
+            A = self._build_basis(layer, C, gamma)
             layer.set_adapter_basis(A)
 
         # 3) (Bank) forward-transfer warm-start from the nearest prior adapter.
@@ -147,13 +152,15 @@ class Instil:
         self.model.train()
         train_step()
 
-        # 5) Grow occupied subspaces with this task's directions (§5.1).
+        # 5) Grow occupied subspaces from the streaming covariance (§5.1).
         for layer in self.layers:
-            a = acts[layer.name]
-            if a.shape[0] > 0:
-                layer.memory.add_task(a, task_id)
+            C, n = cov[layer.name]
+            if n > 0:
+                layer.memory.add_task_cov(C, n, task_id)
             else:
-                layer.memory.add_task(torch.zeros(1, layer.in_features), task_id)
+                # keep block bookkeeping aligned across layers even if empty
+                layer.memory.add_task_cov(
+                    torch.zeros(layer.in_features, layer.in_features), 0, task_id)
 
         # 6) Consolidate: fold in place (merge) or snapshot (bank).
         for layer in self.layers:
@@ -170,7 +177,8 @@ class Instil:
         """No-op in this build (gate is structural); safe to call post-backward."""
         project_instil_gradients(self.model)
 
-    def _collect_activations(self, collect_batches, forward_fn) -> Dict[str, torch.Tensor]:
+    def _collect_activations(self, collect_batches, forward_fn) -> Dict[str, tuple]:
+        """Return ``{layer_name: (covariance in x in, row_count)}`` for the task."""
         budget = self.cfg.max_activation_samples
         for layer in self.layers:
             layer.start_collecting(budget)

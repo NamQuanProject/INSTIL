@@ -11,7 +11,7 @@ Example
 -------
     python scripts/run_instil_t5.py \
         --model_name_or_path t5-large \
-        --data_dir SAPT/CL_Benchmark \
+        --data_dir data \
         --task_order task1572_samsum_summary,task363_sst2_polarity_classification,... \
         --mode bank --lora_r 8 --lora_alpha 16 --epochs 5 \
         --output_dir logs_and_outputs/instil_superni
@@ -41,7 +41,7 @@ from instil.textscore import corpus_score
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model_name_or_path", required=True)
-    p.add_argument("--data_dir", default="SAPT/CL_Benchmark")
+    p.add_argument("--data_dir", default="data")
     p.add_argument("--benchmark", default="SuperNI")
     p.add_argument("--task_order", required=True, help="comma-separated task names")
     p.add_argument("--mode", default="bank", choices=["bank", "merge"])

@@ -27,7 +27,7 @@ class InstilConfig:
     energy_threshold: float = 0.95
     subspace_rank_cap: int = 16
     # How many input-activation rows to collect per task per tracked layer.
-    max_activation_samples: int = 2000
+    max_activation_samples: int = 1000
 
     # ---- Instruction gate  gamma = sigma(a<p_t,p_j> + b)  (§5.2) -----------
     # b is fixed so that gamma > 0.5 only when <p_t,p_j> >= rho0, i.e. b = -a*rho0.

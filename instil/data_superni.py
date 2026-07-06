@@ -1,4 +1,4 @@
-"""SuperNI / Long-Sequence data loading for Instil (matches SAPT's CL_Benchmark).
+"""SuperNI / Long-Sequence data loading for Instil (reads ``data/<benchmark>/``).
 
 Each SuperNI task directory holds ``train.json`` / ``dev.json`` / ``test.json``.
 The JSON has a ``Definition`` (list; ``Definition[0]`` is the natural-language

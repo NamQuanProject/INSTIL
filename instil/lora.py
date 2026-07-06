@@ -78,11 +78,15 @@ class InstilLoRALinear(nn.Module):
         # ---- Bypass: return the pure frozen base (drift-free prototypes) ----
         self._bypass = False
 
-        # ---- Activation capture for subspace building -----------------------
+        # ---- Streaming covariance capture for subspace building -------------
+        # We accumulate C = sum_x x x^T  (in x in, fixed size) on the fly rather
+        # than storing an (N x in) activation matrix, then take its top-r
+        # eigenvectors -- avoiding an expensive SVD over all activations
+        # (HESTIA-style online statistics).
         self._collecting = False
-        self._act_chunks: List[torch.Tensor] = []
+        self._cov: Optional[torch.Tensor] = None
+        self._cov_count = 0
         self._act_budget = 2000
-        self._act_count = 0
 
     # -------------------------------------------------------- adapter setup
     def set_adapter_basis(self, A: torch.Tensor) -> None:
@@ -132,28 +136,36 @@ class InstilLoRALinear(nn.Module):
     # ------------------------------------------------- activation capture
     def start_collecting(self, budget: int = 2000) -> None:
         self._collecting = True
-        self._act_chunks = []
+        self._cov = None
+        self._cov_count = 0
         self._act_budget = budget
-        self._act_count = 0
 
-    def stop_collecting(self) -> torch.Tensor:
+    def stop_collecting(self):
+        """Return ``(C, count)`` -- the accumulated ``in x in`` covariance and
+        the number of rows that went into it (``C`` on CPU float32)."""
         self._collecting = False
-        if not self._act_chunks:
-            return torch.zeros(0, self.in_features)
-        acts = torch.cat(self._act_chunks, dim=0)
-        self._act_chunks = []
-        return acts
+        C = self._cov
+        n = self._cov_count
+        self._cov = None
+        self._cov_count = 0
+        if C is None:
+            return torch.zeros(self.in_features, self.in_features), 0
+        return C.cpu().float(), n
 
     def _maybe_capture(self, x: torch.Tensor) -> None:
-        if not self._collecting or self._act_count >= self._act_budget:
+        if not self._collecting or self._cov_count >= self._act_budget:
             return
-        flat = x.reshape(-1, self.in_features).detach().float().cpu()
-        room = self._act_budget - self._act_count
+        flat = x.reshape(-1, self.in_features).detach().float()
+        room = self._act_budget - self._cov_count
         if flat.shape[0] > room:
-            idx = torch.randperm(flat.shape[0])[:room]
-            flat = flat[idx]
-        self._act_chunks.append(flat)
-        self._act_count += flat.shape[0]
+            flat = flat[:room]
+        # Streaming outer-product accumulation: C += X^T X  (fixed in x in).
+        contrib = flat.t() @ flat
+        if self._cov is None:
+            self._cov = contrib
+        else:
+            self._cov = self._cov + contrib
+        self._cov_count += flat.shape[0]
 
     # ------------------------------------------------------------- forward
     def _delta_out(self, x, A, B):
