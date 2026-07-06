@@ -245,6 +245,14 @@ def inject_instil_lora(model: nn.Module, config, verbose: bool = False) -> List[
             base, r=config.lora_r, alpha=config.lora_alpha,
             dropout=config.lora_dropout, name=name,
         )
+        # Match the base layer's device/dtype so the freshly-created adapter
+        # buffers (delta_prev, lora_A/B) land where the model already lives --
+        # robust whether inject runs before or after model.to(device).
+        try:
+            base_param = next(base.parameters())
+            wrapped = wrapped.to(base_param.device, base_param.dtype)
+        except StopIteration:  # pragma: no cover - base with no params
+            pass
         _set_submodule(model, name, wrapped)
         if verbose:
             print(f"[instil] wrapped {name} ({base.in_features}->{base.out_features})")
