@@ -74,11 +74,12 @@ class Instil:
         pre-pass; free directions come from its top eigenvectors (no SVD).
         """
         mem = layer.memory
+        dev = cov.device
         cols: List[torch.Tensor] = []
         # Null-space (safe) directions the task cares about, orthogonal to U_<t.
         F = mem.free_directions_cov(cov, rank=self.cfg.lora_r)
         if F.shape[1] > 0:
-            cols.append(F)
+            cols.append(F.to(dev))
         # Gated occupied directions: block j admitted with weight gamma_j.
         used = 0
         for j, g in enumerate(gamma.tolist()):
@@ -91,11 +92,11 @@ class Instil:
             if room <= 0:
                 break
             Uj = Uj[:, :room]
-            cols.append(float(g) * Uj)
+            cols.append(float(g) * Uj.to(dev))
             used += Uj.shape[1]
         if not cols:
             # Degenerate: give the task at least one free direction.
-            cols.append(torch.eye(layer.in_features)[:, : self.cfg.lora_r])
+            cols.append(torch.eye(layer.in_features, device=dev)[:, : self.cfg.lora_r])
         basis = torch.cat(cols, dim=1)          # (in, R)
         return basis.t().contiguous()           # (R, in) -- rows are directions
 
@@ -143,11 +144,21 @@ class Instil:
         # 1) Pre-pass: accumulate this task's input covariance (per layer).
         cov = self._collect_activations(collect_batches, forward_fn)
 
-        # 2) Build & install the frozen gated basis A; reset B to 0.
+        # 2) Per layer: build & install the frozen gated basis A (uses U_<t),
+        #    then grow the occupied subspace with U_t (§5.1).  Both use the same
+        #    covariance, so we do them together and free C immediately -- this
+        #    keeps at most one in x in covariance alive at a time on the GPU.
         for layer in self.layers:
-            C, _ = cov[layer.name]
-            A = self._build_basis(layer, C, gamma)
+            C, n = cov[layer.name]
+            A = self._build_basis(layer, C, gamma)     # against U_<t
             layer.set_adapter_basis(A)
+            if n > 0:
+                layer.memory.add_task_cov(C, n, task_id)   # appends U_t
+            else:
+                layer.memory.add_task_cov(
+                    torch.zeros(layer.in_features, layer.in_features,
+                                device=C.device), 0, task_id)
+        del cov                                        # release GPU covariances
 
         # 3) (Bank) forward-transfer warm-start from the nearest prior adapter.
         if self.cfg.mode == "bank" and self.cfg.warm_start and task_id > 0:
@@ -159,17 +170,7 @@ class Instil:
         self.model.train()
         train_step()
 
-        # 5) Grow occupied subspaces from the streaming covariance (§5.1).
-        for layer in self.layers:
-            C, n = cov[layer.name]
-            if n > 0:
-                layer.memory.add_task_cov(C, n, task_id)
-            else:
-                # keep block bookkeeping aligned across layers even if empty
-                layer.memory.add_task_cov(
-                    torch.zeros(layer.in_features, layer.in_features), 0, task_id)
-
-        # 6) Consolidate: fold in place (merge) or snapshot (bank).
+        # 5) Consolidate: fold in place (merge) or snapshot (bank).
         for layer in self.layers:
             if self.cfg.mode == "merge":
                 layer.fold_current_into_prev()
@@ -191,12 +192,20 @@ class Instil:
             layer.start_collecting(budget)
         was_training = self.model.training
         self.model.eval()
+
+        def _all_full():
+            return all(l._cov_count >= l._act_budget for l in self.layers)
+
         with torch.no_grad():
             for batch in tqdm_iter(collect_batches, desc="collect", leave=False):
                 if forward_fn is not None:
                     forward_fn(self.model, batch)
                 else:
                     self.model(**batch)
+                # Each long example fills the row budget fast; once every layer
+                # has enough, stop -- no need to sweep the whole train set.
+                if _all_full():
+                    break
         if was_training:
             self.model.train()
         return {layer.name: layer.stop_collecting() for layer in self.layers}

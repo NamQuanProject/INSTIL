@@ -142,7 +142,8 @@ class InstilLoRALinear(nn.Module):
 
     def stop_collecting(self):
         """Return ``(C, count)`` -- the accumulated ``in x in`` covariance and
-        the number of rows that went into it (``C`` on CPU float32)."""
+        the number of rows that went into it.  ``C`` stays on the device it was
+        accumulated on (typically the GPU) so the eigensolve runs there too."""
         self._collecting = False
         C = self._cov
         n = self._cov_count
@@ -150,7 +151,7 @@ class InstilLoRALinear(nn.Module):
         self._cov_count = 0
         if C is None:
             return torch.zeros(self.in_features, self.in_features), 0
-        return C.cpu().float(), n
+        return C.float(), n
 
     def _maybe_capture(self, x: torch.Tensor) -> None:
         if not self._collecting or self._cov_count >= self._act_budget:

@@ -176,7 +176,7 @@ then pass the fitted value as `--rho0` to `run_instil_t5.py`.
 | Thm. 2 FWT warm-start | `instil.py` `_warm_start` | init `B` from nearest prior adapter via least squares |
 | Prop. 2 routing | `instil.py` `routing_weights`, `answer` | frozen nearest-instruction lookup — zero trainable routing params |
 | §5.4 composition | `lora.py` bank + `answer` | `dW* = Σ_t w_t·dW_t` for blended instructions |
-| §5.1 bookkeeping | `subspace.py` `add_task_cov` | streaming covariance `XᵀX`, top-`r` eigenvectors via `lobpcg` (no full SVD), energy ≥ 0.95, orthogonalised |
+| §5.1 bookkeeping | `subspace.py` `add_task_cov` | streaming covariance `XᵀX`, top-`r` eigenvectors via randomized subspace iteration (no full SVD), energy ≥ 0.95, orthogonalised |
 | §9 metrics | `metrics.py` | same formulas as SAPT `score.py` |
 
 ## 7. Modes (`--mode`)
@@ -256,18 +256,25 @@ instead of hoarding features), Instil now:
 
 1. **Streams a fixed-size covariance** `C = XᵀX` (`in × in`) during the
    collection pass (`InstilLoRALinear._maybe_capture`) — never materialising the
-   `N × in` matrix. Memory drops from `O(N·in)` to `O(in²)`.
+   `N × in` matrix. Memory drops from `O(N·in)` to `O(in²)`. Collection also
+   **stops early** once every layer has its row budget (`max_activation_samples`),
+   so it never sweeps the whole train set.
 2. **Extracts only the top-`r` eigenvectors** of the small symmetric `C` with
-   **`torch.lobpcg`** (`O(in²·r)`, `eigh` fallback for tiny/degenerate cases),
-   instead of a full SVD. Eigenvectors of `XᵀX` are exactly the right singular
-   vectors of `X`, so the subspace is identical — only cheaper. `trace(C)` gives
-   the total energy for the 0.95 cutoff, so no full spectrum is needed.
+   **randomized subspace iteration** (Halko–Martinsson–Tropp — the method behind
+   scikit-learn's `randomized_svd`): a random probe, a couple of power iterations,
+   and one tiny `(r+p)×(r+p)` eigh. This is `O(in²·r)`, all dense matmul/QR, runs
+   **on the GPU**, and — unlike the earlier `torch.lobpcg` — has **no iterative
+   convergence loop that can stall** (that stall was the reported hang). A full
+   `eigh` is used only for small matrices where it is already cheap. Eigenvectors
+   of `XᵀX` are exactly the right singular vectors of `X`, so the subspace is
+   identical; `trace(C)` gives total energy for the 0.95 cutoff.
 
 Net effect: the per-task, per-layer decomposition goes from a full SVD over
-thousands of rows to a top-`r` eigensolve on a single `in × in` matrix, with a
-bounded memory footprint — the accuracy/subspace is unchanged. (The raw-activation
-`SubspaceMemory.add_task` / `free_directions` wrappers are kept for compatibility;
-they just build `XᵀX` and call the covariance path.)
+thousands of rows (CPU) to a randomized top-`r` eigensolve on a single `in × in`
+matrix on the GPU, with a bounded memory footprint — the subspace is unchanged.
+Knobs: `SubspaceMemory(oversample=8, subspace_iters=2, dense_threshold=256)`.
+(The raw-activation `add_task` / `free_directions` wrappers are kept for
+compatibility; they just build `XᵀX` and call the covariance path.)
 
 ## 11. Troubleshooting
 
@@ -278,6 +285,11 @@ they just build `XᵀX` and call the covariance path.)
   or use `t5-base`; the demo/smoke commands run on CPU.
 * *Prototypes look identical* — the `HashingEncoder` is bag-of-words; for real
   runs use `MeanPooledBackboneEncoder` (the default in the scripts).
+* *Hangs right after "Task 0" / subspace step is very slow* — this was the old
+  `torch.lobpcg` stalling in `_update_ortho`; it is replaced by GPU randomized
+  eig (see §10). If you still see a pause there, it is the one-time
+  covariance-collection forward pass; it early-stops at `max_activation_samples`
+  rows, so lower that value to shorten it.
 
 ## 12. Citation
 

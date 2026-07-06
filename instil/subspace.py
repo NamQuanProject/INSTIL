@@ -45,15 +45,28 @@ class SubspaceMemory:
                  energy_threshold: float = 0.95,
                  rank_cap: int = 16,
                  dtype: torch.dtype = torch.float32,
-                 device: str = "cpu"):
+                 device: str = "cpu",
+                 oversample: int = 8,
+                 subspace_iters: int = 2,
+                 dense_threshold: int = 256):
         self.in_features = in_features
         self.energy_threshold = energy_threshold
         self.rank_cap = rank_cap
         self.dtype = dtype
         self.device = device
+        # Randomized-eig knobs (Halko et al.): oversampling and power iterations.
+        self.oversample = oversample
+        self.subspace_iters = subspace_iters
+        self.dense_threshold = dense_threshold  # use exact eigh below this dim
         # U: (in_features, R) orthonormal columns; empty until the first task.
         self.U: torch.Tensor = torch.zeros(in_features, 0, dtype=dtype, device=device)
         self.blocks: List[_TaskBlock] = []
+
+    def _align_device(self, ref: torch.Tensor) -> None:
+        """Keep the stored basis on the same device as the working covariance."""
+        if self.U.device != ref.device:
+            self.U = self.U.to(ref.device)
+        self.device = ref.device
 
     # ------------------------------------------------------------------ state
     @property
@@ -114,30 +127,39 @@ class SubspaceMemory:
     def _top_eig(self, C: torch.Tensor, k: int):
         """Top-``k`` eigenpairs of a symmetric PSD matrix ``C`` (in x in).
 
-        Uses LOBPCG -- O(in^2 * k) for the k leading directions -- instead of a
-        full SVD/eigh, following the streaming, low-order-statistics philosophy
-        of HESTIA's OnlineDiagonalGMM.  Falls back to a dense ``eigh`` for small
-        matrices or if LOBPCG fails to converge.
+        Uses **randomized subspace iteration** (Halko, Martinsson & Tropp 2011 --
+        the method behind scikit-learn's ``randomized_svd``): draw a small random
+        probe, run a couple of power iterations, and diagonalise the tiny
+        projected matrix.  Cost is ``O(in^2 * k)`` with only dense matmuls / QR /
+        a ``(k+p) x (k+p)`` eigh, so it runs entirely on the GPU and -- unlike
+        LOBPCG -- has no iterative convergence loop that can stall.  A full
+        ``eigh`` is used for small matrices where it is already cheap.
 
-        Returns ``(eigvals desc (k,), eigvecs (in, k))`` with eigvals clamped >=0.
+        Runs on ``C``'s device.  Returns ``(eigvals desc (k,), eigvecs (in, k))``
+        with eigvals clamped >= 0.
         """
-        C = C.to(self.dtype).to(self.device)
+        C = C.to(self.dtype)
         d = C.shape[0]
         k = max(1, min(k, d))
-        # Tiny ridge keeps the matrix strictly PD for LOBPCG stability.
-        jitter = 1e-6 * (C.diagonal().mean().abs() + 1e-12)
-        use_dense = (d <= 64) or (k >= d - 1)
-        if not use_dense:
-            try:
-                Cj = C + jitter * torch.eye(d, dtype=self.dtype, device=self.device)
-                evals, evecs = torch.lobpcg(Cj, k=k, largest=True)
-                return evals.clamp(min=0.0), evecs
-            except Exception:  # pragma: no cover - fall back to dense
-                use_dense = True
-        evals, evecs = torch.linalg.eigh(C)          # ascending
-        evals = evals.flip(0)[:k].clamp(min=0.0)
-        evecs = evecs.flip(1)[:, :k]
-        return evals, evecs
+        if d <= self.dense_threshold or k >= d - 1:
+            evals, evecs = torch.linalg.eigh(C)          # ascending
+            return evals.flip(0)[:k].clamp(min=0.0), evecs.flip(1)[:, :k]
+
+        # Randomized range finder + power iterations for the top subspace.
+        p = min(self.oversample, d - k)
+        kk = k + p
+        Omega = torch.randn(d, kk, dtype=self.dtype, device=C.device)
+        Q, _ = torch.linalg.qr(C @ Omega)
+        for _ in range(self.subspace_iters):
+            Q, _ = torch.linalg.qr(C @ Q)                # subspace iteration
+        # Rayleigh-Ritz on the small projected matrix.
+        B = Q.t() @ (C @ Q)                              # (kk, kk)
+        B = 0.5 * (B + B.t())
+        evals, V = torch.linalg.eigh(B)
+        evals = evals.flip(0).clamp(min=0.0)
+        V = V.flip(1)
+        U = Q @ V                                        # lift back to in-space
+        return evals[:k], U[:, :k]
 
     def _rank_for_energy(self, evals: torch.Tensor, total_energy: torch.Tensor,
                          rank: int) -> int:
@@ -175,9 +197,10 @@ class SubspaceMemory:
         occupied by prior tasks removed (orthogonal to ``span(U_<t)``).  These
         are the safe rows of the frozen adapter basis ``A`` (shape ``in x r``).
         """
-        C = C.to(self.dtype).to(self.device)
+        C = C.to(self.dtype)
+        self._align_device(C)                 # keep basis on C's device (GPU)
         if C.abs().sum() == 0:
-            return torch.zeros(self.in_features, 0, dtype=self.dtype, device=self.device)
+            return torch.zeros(self.in_features, 0, dtype=self.dtype, device=C.device)
         _, V = self._top_eig(C, rank)
         return self._orthonormalize_against_prior(V)
 
@@ -188,11 +211,12 @@ class SubspaceMemory:
         Energy is read directly from the eigenvalues and ``trace(C)`` (== total
         energy), so no full spectrum is needed.  Returns #new columns appended.
         """
-        C = C.to(self.dtype).to(self.device)
+        C = C.to(self.dtype)
         if C.shape != (self.in_features, self.in_features):
             raise ValueError(
                 f"expected ({self.in_features},{self.in_features}) covariance, "
                 f"got {tuple(C.shape)}")
+        self._align_device(C)                 # keep basis on C's device (GPU)
         if count <= 0 or C.abs().sum() == 0:
             # Empty/degenerate task: register an empty block for bookkeeping.
             self.blocks.append(_TaskBlock(task_id, self.rank, self.rank))

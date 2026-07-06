@@ -107,7 +107,7 @@ def main():
             m = layer.memory
             if cnt > 0:
                 m.add_task_cov(C, cnt, i)
-            subs[n] = m.basis_for(i)
+            subs[n] = m.basis_for(i).cpu()   # align with CPU-accumulated gradients
         task_subspaces.append(subs)
 
         # (b) weight-space gradient G_j at the shared pretrained point
